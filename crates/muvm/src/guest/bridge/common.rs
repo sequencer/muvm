@@ -27,6 +27,7 @@ const VIRTGPU_CONTEXT_PARAM_CAPSET_ID: u64 = 0x0001;
 const VIRTGPU_CONTEXT_PARAM_NUM_RINGS: u64 = 0x0002;
 const VIRTGPU_CONTEXT_PARAM_POLL_RINGS_MASK: u64 = 0x0003;
 const CAPSET_CROSS_DOMAIN: u64 = 5;
+const CROSS_DOMAIN_QUERY_RING: u32 = 0;
 const CROSS_DOMAIN_CHANNEL_RING: u32 = 1;
 const VIRTGPU_BLOB_MEM_GUEST: u32 = 0x0001;
 const VIRTGPU_BLOB_MEM_HOST3D: u32 = 0x0002;
@@ -403,6 +404,8 @@ impl Context {
             size: mem::size_of::<CrossDomainGetImageRequirements>() as u32,
             bo_handles: handles.as_ptr() as u64,
             num_bo_handles: 1,
+            flags: VIRTGPU_EXECBUF_RING_IDX,
+            ring_idx: CROSS_DOMAIN_QUERY_RING,
             ..DrmVirtgpuExecbuffer::default()
         };
         let mut wait = DrmVirtgpuWait {
