@@ -223,7 +223,7 @@ impl ProtocolHandler for X11ProtocolHandler {
 
     fn process_recv_stream(
         this: &mut Client<Self>,
-        data: &[u8],
+        data: &mut [u8],
         resources: &mut VecDeque<CrossDomainResource>,
     ) -> Result<StreamRecvResult> {
         if !this.protocol_handler.got_first_resp {

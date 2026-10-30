@@ -277,7 +277,7 @@ impl ProtocolHandler for PipeWireProtocolHandler {
 
     fn process_recv_stream(
         this: &mut Client<Self>,
-        data: &[u8],
+        data: &mut [u8],
         resources: &mut VecDeque<CrossDomainResource>,
     ) -> Result<StreamRecvResult> {
         if data.len() < PipeWireHeader::SIZE {

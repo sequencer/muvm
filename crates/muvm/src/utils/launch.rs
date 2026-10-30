@@ -41,6 +41,7 @@ pub struct GuestConfiguration {
     pub uid: u32,
     pub gid: u32,
     pub host_display: Option<String>,
+    pub host_wayland: bool,
     pub merged_rootfs: bool,
     pub emulator: Option<Emulator>,
     pub cwd: PathBuf,

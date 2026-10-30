@@ -8,6 +8,7 @@ use std::{cmp, env, fs, thread};
 use anyhow::{anyhow, Context, Result};
 use muvm::guest::box64::setup_box;
 use muvm::guest::bridge::pipewire::start_pwbridge;
+use muvm::guest::bridge::wayland::start_wlbridge;
 use muvm::guest::bridge::x11::start_x11bridge;
 use muvm::guest::fex::setup_fex;
 use muvm::guest::hidpipe::start_hidpipe;
@@ -143,8 +144,23 @@ fn main() -> Result<ExitCode> {
     let pulse_path = pulse_path.join("native");
     setup_socket_proxy(pulse_path, PULSE_SOCKET)?;
 
+    let wayland_path = run_path.join("wayland-0");
+    if options.host_wayland {
+        // SAFETY: Safe if and only if `muvm-guest` program is not multithreaded.
+        // See https://doc.rust-lang.org/std/env/fn.set_var.html#safety
+        env::set_var("WAYLAND_DISPLAY", "wayland-0");
+    }
+
     if let Some(host_display) = options.host_display {
         setup_x11_forwarding(run_path, &host_display)?;
+    }
+
+    if options.host_wayland {
+        thread::spawn(move || {
+            if catch_unwind(|| start_wlbridge(wayland_path.to_str().unwrap())).is_err() {
+                eprintln!("wlbridge thread crashed, wayland passthrough will no longer function");
+            }
+        });
     }
 
     let uid = options.uid;

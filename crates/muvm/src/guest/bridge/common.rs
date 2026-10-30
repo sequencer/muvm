@@ -15,6 +15,7 @@ use log::debug;
 use nix::errno::Errno;
 use nix::libc::{c_int, c_void, off_t, O_RDWR};
 use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
+use nix::sys::memfd::{memfd_create, MFdFlags};
 use nix::sys::mman::{mmap, munmap, MapFlags, ProtFlags};
 use nix::sys::socket::{recvmsg, sendmsg, ControlMessage, ControlMessageOwned, MsgFlags, RecvMsg};
 use nix::unistd::read;
@@ -150,6 +151,16 @@ ioctl_readwrite!(drm_virtgpu_resource_info, 'd', 0x40 + 0x5, DrmVirtgpuResourceI
 
 #[repr(C)]
 #[derive(Default)]
+struct DrmVirtgpuWait {
+    handle: u32,
+    flags: u32,
+}
+
+#[rustfmt::skip]
+ioctl_readwrite!(drm_virtgpu_wait, 'd', 0x40 + 0x8, DrmVirtgpuWait);
+
+#[repr(C)]
+#[derive(Default)]
 pub struct CrossDomainHeader {
     pub cmd: u8,
     pub fence_ctx_idx: u8,
@@ -215,6 +226,32 @@ struct CrossDomainSendReceive<T: ?Sized> {
 }
 
 const CROSS_DOMAIN_SR_TAIL_SIZE: usize = PAGE_SIZE - mem::size_of::<CrossDomainSendReceive<()>>();
+
+const CROSS_DOMAIN_CMD_GET_IMAGE_REQUIREMENTS: u8 = 2;
+const DRM_FORMAT_R8: u32 = 0x20203852;
+
+#[repr(C)]
+#[derive(Default)]
+struct CrossDomainGetImageRequirements {
+    hdr: CrossDomainHeader,
+    width: u32,
+    height: u32,
+    drm_format: u32,
+    flags: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct CrossDomainImageRequirements {
+    strides: [u32; 4],
+    offsets: [u32; 4],
+    modifier: u64,
+    size: u64,
+    blob_id: u32,
+    map_info: u32,
+    memory_idx: i32,
+    physical_device_idx: i32,
+}
 
 pub struct GpuRing {
     handle: u32,
@@ -347,6 +384,110 @@ impl Context {
             Some(CROSS_DOMAIN_CHANNEL_RING),
         )
     }
+
+    /// Host gralloc allocation for a linear R8 image; the reply arrives on the query ring.
+    fn image_requirements(&self, width: u32, height: u32) -> Result<CrossDomainImageRequirements> {
+        let cmd = CrossDomainGetImageRequirements {
+            hdr: CrossDomainHeader::new(
+                CROSS_DOMAIN_CMD_GET_IMAGE_REQUIREMENTS,
+                mem::size_of::<CrossDomainGetImageRequirements>() as u16,
+            ),
+            width,
+            height,
+            drm_format: DRM_FORMAT_R8,
+            flags: 0,
+        };
+        let handles = [self.query_ring.handle];
+        let mut exec = DrmVirtgpuExecbuffer {
+            command: &cmd as *const _ as u64,
+            size: mem::size_of::<CrossDomainGetImageRequirements>() as u32,
+            bo_handles: handles.as_ptr() as u64,
+            num_bo_handles: 1,
+            ..DrmVirtgpuExecbuffer::default()
+        };
+        let mut wait = DrmVirtgpuWait {
+            handle: self.query_ring.handle,
+            flags: 0,
+        };
+        // SAFETY: `exec`, `cmd`, `handles` and `wait` outlive the calls; the host has written
+        // the reply to the query ring once the wait returns.
+        unsafe {
+            drm_virtgpu_execbuffer(self.fd.as_raw_fd() as c_int, &mut exec)?;
+            drm_virtgpu_wait(self.fd.as_raw_fd() as c_int, &mut wait)?;
+            Ok(std::ptr::read_volatile(
+                self.query_ring.address as *const CrossDomainImageRequirements,
+            ))
+        }
+    }
+}
+
+/// A host-visible virtio-gpu blob mapped into this process.
+pub struct MappedBlob {
+    fd: OwnedFd,
+    handle: u32,
+    pub res_id: u32,
+    pub ptr: *mut u8,
+    pub len: usize,
+}
+
+impl MappedBlob {
+    fn new(fd: &OwnedFd, blob_id: u64, size: usize, prot: ProtFlags) -> Result<MappedBlob> {
+        let fd = fd.try_clone()?;
+        let len = size.next_multiple_of(PAGE_SIZE);
+        let mut create_blob = DrmVirtgpuResourceCreateBlob {
+            blob_mem: VIRTGPU_BLOB_MEM_HOST3D,
+            blob_flags: VIRTGPU_BLOB_FLAG_USE_MAPPABLE | VIRTGPU_BLOB_FLAG_USE_SHAREABLE,
+            size: len as u64,
+            blob_id,
+            ..DrmVirtgpuResourceCreateBlob::default()
+        };
+        // SAFETY: `create_blob` outlives the call
+        unsafe {
+            drm_virtgpu_resource_create_blob(fd.as_raw_fd() as c_int, &mut create_blob)?;
+        }
+        let mut map = DrmVirtgpuMap {
+            handle: create_blob.bo_handle,
+            ..DrmVirtgpuMap::default()
+        };
+        let close = DrmGemClose::new(create_blob.bo_handle);
+        // SAFETY: `map` outlives the call; the mapping covers exactly the blob
+        let ptr = unsafe {
+            drm_virtgpu_map(fd.as_raw_fd() as c_int, &mut map)
+                .map_err(anyhow::Error::from)
+                .and_then(|_| {
+                    Ok(mmap(
+                        None,
+                        NonZeroUsize::new(len).unwrap(),
+                        prot,
+                        MapFlags::MAP_SHARED,
+                        &fd,
+                        map.offset as off_t,
+                    )?)
+                })
+                .inspect_err(|_| {
+                    let _ = drm_gem_close(fd.as_raw_fd() as c_int, &close);
+                })?
+                .as_ptr() as *mut u8
+        };
+        Ok(MappedBlob {
+            fd,
+            handle: create_blob.bo_handle,
+            res_id: create_blob.res_handle,
+            ptr,
+            len,
+        })
+    }
+}
+
+impl Drop for MappedBlob {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` / `len` come from mmap, and we own `handle`
+        unsafe {
+            munmap(NonNull::new(self.ptr as *mut c_void).unwrap(), self.len).unwrap();
+            let close = DrmGemClose::new(self.handle);
+            drm_gem_close(self.fd.as_raw_fd() as c_int, &close).unwrap();
+        }
+    }
 }
 
 pub fn submit_cmd_raw<T>(fd: c_int, cmd: &T, cmd_size: usize, ring_idx: Option<u32>) -> Result<()> {
@@ -452,7 +593,7 @@ pub trait ProtocolHandler: Sized {
 
     fn process_recv_stream(
         this: &mut Client<Self>,
-        data: &[u8],
+        data: &mut [u8],
         resources: &mut VecDeque<CrossDomainResource>,
     ) -> Result<StreamRecvResult>;
 
@@ -775,6 +916,34 @@ impl<'a, P: ProtocolHandler> Client<'a, P> {
         Ok(false)
     }
 
+    /// Host shared memory (gralloc memfd) of at least `size` bytes, mapped read-write here;
+    /// sent to the host as a VIRTGPU_BLOB identifier with `res_id`.
+    pub fn alloc_host_shm(&self, size: usize) -> Result<MappedBlob> {
+        let height = size.div_ceil(PAGE_SIZE) as u32;
+        let reqs = self.gpu_ctx.image_requirements(PAGE_SIZE as u32, height)?;
+        MappedBlob::new(
+            &self.gpu_ctx.fd,
+            reqs.blob_id as u64,
+            reqs.size as usize,
+            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+        )
+    }
+
+    /// Copy of a host-sent file (keymap, format table) into a guest memfd.
+    pub fn virtgpu_id_to_memfd(&self, rsc: CrossDomainResource) -> Result<OwnedFd> {
+        let size = rsc.identifier_size as usize;
+        let blob = MappedBlob::new(
+            &self.gpu_ctx.fd,
+            rsc.identifier as u64,
+            size.max(1),
+            ProtFlags::PROT_READ,
+        )?;
+        let mut file = File::from(memfd_create(c"muvm-wl", MFdFlags::MFD_CLOEXEC)?);
+        // SAFETY: the mapping covers at least `size` bytes
+        file.write_all(unsafe { slice::from_raw_parts(blob.ptr, size) })?;
+        Ok(file.into())
+    }
+
     pub fn virtgpu_id_to_prime(&mut self, rsc: CrossDomainResource) -> Result<OwnedFd> {
         let mut create_blob = DrmVirtgpuResourceCreateBlob {
             blob_mem: VIRTGPU_BLOB_MEM_HOST3D,
@@ -839,7 +1008,7 @@ impl<'a, P: ProtocolHandler> Client<'a, P> {
             return Ok(());
         }
 
-        let data = if self.reply_head.is_empty() {
+        let mut data = if self.reply_head.is_empty() {
             data.to_vec()
         } else {
             let mut new_data = core::mem::take(&mut self.reply_head);
@@ -850,7 +1019,7 @@ impl<'a, P: ProtocolHandler> Client<'a, P> {
         let mut ptr = 0;
         let mut owned_fds = Vec::new();
         while ptr < data.len() {
-            match P::process_recv_stream(self, &data[ptr..], &mut identifiers)? {
+            match P::process_recv_stream(self, &mut data[ptr..], &mut identifiers)? {
                 StreamRecvResult::Processed {
                     consumed_bytes,
                     fds,

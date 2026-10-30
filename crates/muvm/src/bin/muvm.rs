@@ -408,6 +408,7 @@ fn main() -> Result<ExitCode> {
         uid,
         gid: getgid().as_raw(),
         host_display: display,
+        host_wayland: env::var_os("WAYLAND_DISPLAY").is_some(),
         merged_rootfs: options.merged_rootfs,
         emulator: options.emulator,
         cwd,
